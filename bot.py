@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import asyncio
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
@@ -15,6 +16,9 @@ logging.basicConfig(
 # Global dictionary to maintain chat history per Telegram user/chat
 CHAT_HISTORIES = {}
 MAX_HISTORY_MESSAGES = 20  # Retains up to 10 back-and-forth turns per chat
+
+# Global buffer to aggregate Telegram photo albums / media groups
+MEDIA_GROUPS = {}
 
 # --- 1. Flask Keep-Alive Server for Render ---
 web_app = Flask('')
@@ -55,6 +59,7 @@ You MUST strictly select the correct MiniMax H3 mode based on user inputs unless
 
 4. FIRST & LAST FRAME (FL2VA):
    - TRIGGER: User sends EXACTLY 2 images.
+   - OUTPUT FORMAT: Must reference <Picture 1> at 0.00s as the initial frame and <Picture 2> as the final frame timestamp. Uses Base Mode fields (`integrated_multimodal_description`, `overall_soundscape`, `non_diegetic_music`).
 =============================================
 """
 
@@ -98,6 +103,13 @@ SAFETY_SETTINGS = [
     ),
 ]
 
+# Active Gemini 3.x production models fallback hierarchy
+FALLBACK_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-pro"
+]
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     CHAT_HISTORIES[chat_id] = []
@@ -122,99 +134,122 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CHAT_HISTORIES[chat_id] = []
 
     await message.reply_chat_action(action="typing")
-    current_parts = []
 
-    media_obj = None
-    mime_type = None
+    media_group_id = message.media_group_id
 
-    # Handle media types
-    if message.photo:
-        media_obj = message.photo[-1]
-        mime_type = "image/jpeg"
-    elif message.video:
-        media_obj = message.video
-        mime_type = message.video.mime_type or "video/mp4"
-    elif message.video_note:
-        media_obj = message.video_note
-        mime_type = "video/mp4"
-    elif message.audio:
-        media_obj = message.audio
-        mime_type = message.audio.mime_type or "audio/mpeg"
-    elif message.voice:
-        media_obj = message.voice
-        mime_type = message.voice.mime_type or "audio/ogg"
+    # Aggregate multi-image uploads (Telegram photo albums) into a single API batch
+    if media_group_id:
+        if media_group_id not in MEDIA_GROUPS:
+            MEDIA_GROUPS[media_group_id] = {"parts": [], "text": ""}
 
-    # Download byte stream for attached media
-    if media_obj:
-        file_info = await context.bot.get_file(media_obj.file_id)
-        media_bytes = await file_info.download_as_bytearray()
-        current_parts.append(
-            types.Part.from_bytes(
-                data=bytes(media_bytes),
-                mime_type=mime_type
+        if message.photo:
+            file_info = await context.bot.get_file(message.photo[-1].file_id)
+            media_bytes = await file_info.download_as_bytearray()
+            MEDIA_GROUPS[media_group_id]["parts"].append(
+                types.Part.from_bytes(data=bytes(media_bytes), mime_type="image/jpeg")
             )
-        )
+        elif message.video:
+            file_info = await context.bot.get_file(message.video.file_id)
+            media_bytes = await file_info.download_as_bytearray()
+            MEDIA_GROUPS[media_group_id]["parts"].append(
+                types.Part.from_bytes(data=bytes(media_bytes), mime_type=message.video.mime_type or "video/mp4")
+            )
 
-    # Process text or caption
-    user_text = message.text or message.caption or (
-        "Analyze this media input objectively and generate a MiniMax H3 prompt." if media_obj else ""
-    )
-    if user_text:
+        caption = message.text or message.caption
+        if caption:
+            MEDIA_GROUPS[media_group_id]["text"] = caption
+
+        await asyncio.sleep(1.2)
+
+        if media_group_id not in MEDIA_GROUPS:
+            return  # Handled by parallel event handler turn
+
+        group_data = MEDIA_GROUPS.pop(media_group_id)
+        current_parts = group_data["parts"]
+        user_text = group_data["text"] or "Analyze these media inputs objectively and generate a MiniMax H3 prompt."
         current_parts.append(types.Part.from_text(text=user_text))
+
+    else:
+        current_parts = []
+        media_obj = None
+        mime_type = None
+
+        if message.photo:
+            media_obj = message.photo[-1]
+            mime_type = "image/jpeg"
+        elif message.video:
+            media_obj = message.video
+            mime_type = message.video.mime_type or "video/mp4"
+        elif message.video_note:
+            media_obj = message.video_note
+            mime_type = "video/mp4"
+        elif message.audio:
+            media_obj = message.audio
+            mime_type = message.audio.mime_type or "audio/mpeg"
+        elif message.voice:
+            media_obj = message.voice
+            mime_type = message.voice.mime_type or "audio/ogg"
+
+        if media_obj:
+            file_info = await context.bot.get_file(media_obj.file_id)
+            media_bytes = await file_info.download_as_bytearray()
+            current_parts.append(
+                types.Part.from_bytes(data=bytes(media_bytes), mime_type=mime_type)
+            )
+
+        user_text = message.text or message.caption or (
+            "Analyze this media input objectively and generate a MiniMax H3 prompt." if media_obj else ""
+        )
+        if user_text:
+            current_parts.append(types.Part.from_text(text=user_text))
 
     if not current_parts:
         await message.reply_text("Please send text, an image, a video, or an audio file.")
         return
 
-    # Add current turn to session history
+    # Store user turn in active chat session
     user_content = types.Content(role="user", parts=current_parts)
     CHAT_HISTORIES[chat_id].append(user_content)
 
-    # Trim history buffer to prevent token overflow
     if len(CHAT_HISTORIES[chat_id]) > MAX_HISTORY_MESSAGES:
         CHAT_HISTORIES[chat_id] = CHAT_HISTORIES[chat_id][-MAX_HISTORY_MESSAGES:]
 
-    try:
-        config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTIONS,
-            safety_settings=SAFETY_SETTINGS,
-        )
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTIONS,
+        safety_settings=SAFETY_SETTINGS,
+    )
 
-        # Primary attempt with gemini-3.6-flash, fallback to gemini-2.0-flash on quota limit
+    response = None
+    last_error = None
+
+    # Sequential iteration across Gemini 3.x models
+    for model_name in FALLBACK_MODELS:
         try:
             response = ai_client.models.generate_content(
-                model="gemini-3.6-flash",
+                model=model_name,
                 contents=CHAT_HISTORIES[chat_id],
                 config=config,
             )
+            if response and response.text:
+                logging.info(f"Successfully generated response using {model_name}")
+                break
         except Exception as api_err:
-            err_str = str(api_err)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
-                logging.warning("Gemini 3.6 Flash quota reached. Falling back to Gemini 2.0 Flash...")
-                response = ai_client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=CHAT_HISTORIES[chat_id],
-                    config=config,
-                )
-            else:
-                raise api_err
+            last_error = api_err
+            logging.warning(f"Model {model_name} failed: {api_err}. Trying next fallback...")
+            continue
 
-        if response.text:
-            model_content = types.Content(
-                role="model",
-                parts=[types.Part.from_text(text=response.text)]
-            )
-            CHAT_HISTORIES[chat_id].append(model_content)
-            await message.reply_text(response.text)
-        else:
-            await message.reply_text("⚠️ No text output returned by the model.")
-
-    except Exception as e:
-        # Revert memory stack on API error
+    if response and response.text:
+        model_content = types.Content(
+            role="model",
+            parts=[types.Part.from_text(text=response.text)]
+        )
+        CHAT_HISTORIES[chat_id].append(model_content)
+        await message.reply_text(response.text)
+    else:
         if CHAT_HISTORIES[chat_id]:
             CHAT_HISTORIES[chat_id].pop()
-        logging.error(f"Error generating content: {e}")
-        await message.reply_text(f"⚠️ Error processing request: {e}")
+        logging.error(f"All model attempts failed. Last error: {last_error}")
+        await message.reply_text(f"⚠️ API Request Failed: {last_error}")
 
 def main():
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -239,7 +274,7 @@ def main():
 
     app.add_handler(MessageHandler(media_filters, handle_message))
 
-    logging.info("Bot starting with full multimodal support, chat memory, mode routing, automatic model fallback, and keep-alive...")
+    logging.info("Bot starting with album aggregation, Gemini 3.x fallback routing, and keep-alive...")
     app.run_polling()
 
 if __name__ == "__main__":
