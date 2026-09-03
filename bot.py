@@ -15,10 +15,8 @@ logging.basicConfig(
 
 CHAT_HISTORIES = {}
 MAX_HISTORY_MESSAGES = 20
-
-# Active Media Storage per chat to prevent vision context decay on follow-up texts
 LAST_MEDIA = {}
-MEDIA_GROUPS = {}
+CHAT_BUFFERS = {}  # Per-chat debouncer buffer
 
 # --- 1. Flask Keep-Alive Server ---
 web_app = Flask('')
@@ -121,6 +119,10 @@ async def reset_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     CHAT_HISTORIES[chat_id] = []
     LAST_MEDIA[chat_id] = []
+    if chat_id in CHAT_BUFFERS:
+        if CHAT_BUFFERS[chat_id]["task"]:
+            CHAT_BUFFERS[chat_id]["task"].cancel()
+        del CHAT_BUFFERS[chat_id]
     await update.message.reply_text("🔄 Project state and media memory cleared!")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,76 +136,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await message.reply_chat_action(action="typing")
 
-    media_group_id = message.media_group_id
-    new_media_parts = []
+    # Extract media bytes immediately per incoming update
+    part = None
+    if message.photo:
+        file_info = await context.bot.get_file(message.photo[-1].file_id)
+        media_bytes = await file_info.download_as_bytearray()
+        part = types.Part.from_bytes(data=bytes(media_bytes), mime_type="image/jpeg")
+    elif message.video:
+        file_info = await context.bot.get_file(message.video.file_id)
+        media_bytes = await file_info.download_as_bytearray()
+        part = types.Part.from_bytes(data=bytes(media_bytes), mime_type=message.video.mime_type or "video/mp4")
+    elif message.video_note:
+        file_info = await context.bot.get_file(message.video_note.file_id)
+        media_bytes = await file_info.download_as_bytearray()
+        part = types.Part.from_bytes(data=bytes(media_bytes), mime_type="video/mp4")
 
-    # Handle multi-photo album uploads
-    if media_group_id:
-        if media_group_id not in MEDIA_GROUPS:
-            MEDIA_GROUPS[media_group_id] = {
-                "parts": [],
-                "text": "",
-                "lock": asyncio.Lock(),
-                "processed": False
-            }
+    text_content = message.text or message.caption or ""
 
-        group = MEDIA_GROUPS[media_group_id]
+    if chat_id not in CHAT_BUFFERS:
+        CHAT_BUFFERS[chat_id] = {
+            "parts": [],
+            "texts": [],
+            "task": None,
+            "message": message
+        }
 
-        part = None
-        if message.photo:
-            file_info = await context.bot.get_file(message.photo[-1].file_id)
-            media_bytes = await file_info.download_as_bytearray()
-            part = types.Part.from_bytes(data=bytes(media_bytes), mime_type="image/jpeg")
-        elif message.video:
-            file_info = await context.bot.get_file(message.video.file_id)
-            media_bytes = await file_info.download_as_bytearray()
-            part = types.Part.from_bytes(data=bytes(media_bytes), mime_type=message.video.mime_type or "video/mp4")
+    buf = CHAT_BUFFERS[chat_id]
+    if part:
+        buf["parts"].append(part)
+    if text_content:
+        buf["texts"].append(text_content)
+    buf["message"] = message
 
-        caption = message.text or message.caption
+    # Cancel previous pending timer task if a new update arrives within 1.5 seconds
+    if buf["task"] and not buf["task"].done():
+        buf["task"].cancel()
 
-        async with group["lock"]:
-            if part:
-                group["parts"].append(part)
-            if caption:
-                group["text"] = caption
+    # Reset timer for 1.5 seconds quiet period before execution
+    buf["task"] = asyncio.create_task(
+        process_buffered_chat(chat_id, context)
+    )
 
-        await asyncio.sleep(2.0)
+async def process_buffered_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await asyncio.sleep(1.5)
+    except asyncio.CancelledError:
+        return  # Interrupted by a newer incoming update from the same user
 
-        async with group["lock"]:
-            if group["processed"]:
-                return
-            group["processed"] = True
+    buf = CHAT_BUFFERS.pop(chat_id, None)
+    if not buf:
+        return
 
-        group_data = MEDIA_GROUPS.pop(media_group_id, None)
-        if not group_data or not group_data["parts"]:
-            return
+    message = buf["message"]
+    new_media_parts = buf["parts"]
+    user_text = "\n".join([t for t in buf["texts"] if t.strip()])
 
-        new_media_parts = group_data["parts"]
-        user_text = group_data["text"] or "Analyze these media inputs objectively and generate a MiniMax H3 prompt."
-
-    else:
-        part = None
-        mime_type = None
-
-        if message.photo:
-            file_info = await context.bot.get_file(message.photo[-1].file_id)
-            media_bytes = await file_info.download_as_bytearray()
-            part = types.Part.from_bytes(data=bytes(media_bytes), mime_type="image/jpeg")
-        elif message.video:
-            file_info = await context.bot.get_file(message.video.file_id)
-            media_bytes = await file_info.download_as_bytearray()
-            part = types.Part.from_bytes(data=bytes(media_bytes), mime_type=message.video.mime_type or "video/mp4")
-        elif message.video_note:
-            file_info = await context.bot.get_file(message.video_note.file_id)
-            media_bytes = await file_info.download_as_bytearray()
-            part = types.Part.from_bytes(data=bytes(media_bytes), mime_type="video/mp4")
-
-        if part:
-            new_media_parts.append(part)
-
-        user_text = message.text or message.caption or ""
-
-    # Update active project media if new media was sent, else re-use active project media
+    # Update active project media if new attachments were provided
     if new_media_parts:
         LAST_MEDIA[chat_id] = new_media_parts
         active_media = new_media_parts
@@ -214,10 +202,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Please send text, an image, or a video.")
         return
 
-    # Construct request payload with active media anchor + user prompt
     current_parts = list(active_media)
     if user_text:
         current_parts.append(types.Part.from_text(text=user_text))
+    elif not new_media_parts:
+        current_parts.append(types.Part.from_text(text="Analyze this media input objectively and generate a MiniMax H3 prompt."))
 
     user_content = types.Content(role="user", parts=current_parts)
     CHAT_HISTORIES[chat_id].append(user_content)
@@ -284,7 +273,7 @@ def main():
 
     app.add_handler(MessageHandler(media_filters, handle_message))
 
-    logging.info("Bot running with media anchor retention...")
+    logging.info("Bot running with chat debouncer...")
     app.run_polling()
 
 if __name__ == "__main__":
