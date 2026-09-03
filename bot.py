@@ -1,10 +1,12 @@
 import os
 import logging
 import threading
+import io
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from google import genai
+from google.genai import types
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -46,17 +48,38 @@ ai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send me your draft prompt or video details, and I will format it into a MiniMax H3 prompt."
+        "Send me your draft prompt, video details, or an image with instructions, and I will format it into a MiniMax H3 prompt."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_prompt = update.message.text
     await update.message.reply_chat_action(action="typing")
+
+    contents = []
+
+    # Handle image if attached
+    if update.message.photo:
+        # Get highest resolution photo
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        
+        # Format image for Google GenAI SDK
+        image_part = types.Part.from_bytes(
+            data=bytes(photo_bytes),
+            mime_type="image/jpeg"
+        )
+        contents.append(image_part)
+        
+        # Get accompanying caption text
+        user_text = update.message.caption or "Analyze this image and generate a MiniMax H3 prompt."
+        contents.append(user_text)
+    else:
+        # Handle plain text message
+        contents.append(update.message.text)
 
     try:
         response = ai_client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=user_prompt,
+            contents=contents,
             config={
                 "system_instruction": SYSTEM_INSTRUCTIONS,
             }
@@ -71,12 +94,13 @@ def main():
     if not telegram_token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
 
-    # Start the HTTP server thread to satisfy Render's port check and receive pings
     keep_alive()
 
     app = ApplicationBuilder().token(telegram_token).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Updated filter to accept both text and photos (with or without captions)
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message))
 
     logging.info("Bot starting...")
     app.run_polling()
