@@ -4,25 +4,32 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from google import genai
 
-# Enable logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# Load skill.md rules
-def load_skill_instructions():
-    try:
+def load_system_instructions():
+    instructions = []
+    
+    # Load primary skill.md
+    if os.path.exists("skill.md"):
         with open("skill.md", "r", encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        logging.warning("skill.md not found! System instructions will be empty.")
-        return ""
+            instructions.append(f.read())
+            
+    # Load split reference files under Option B
+    for ref_file in ["references/base-en.txt", "references/ref-en.txt"]:
+        if os.path.exists(ref_file):
+            with open(ref_file, "r", encoding="utf-8") as f:
+                instructions.append(f.read())
+                
+    if not instructions:
+        logging.warning("No instruction files found!")
+        
+    return "\n\n---\n\n".join(instructions)
 
-SKILL_INSTRUCTIONS = load_skill_instructions()
+SYSTEM_INSTRUCTIONS = load_system_instructions()
 
-# Initialize Gemini Client
-# Expects GEMINI_API_KEY set in environment variables
 ai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -39,7 +46,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model="gemini-2.5-flash",
             contents=user_prompt,
             config={
-                "system_instruction": SKILL_INSTRUCTIONS,
+                "system_instruction": SYSTEM_INSTRUCTIONS,
             }
         )
         await update.message.reply_text(response.text)
