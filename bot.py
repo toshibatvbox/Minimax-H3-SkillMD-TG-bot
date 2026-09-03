@@ -32,9 +32,34 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# --- 2. System Instructions Loader (skill.md + references) ---
+# --- 2. System Instructions Loader (skill.md + references + Mode Routing Protocol) ---
+MODE_ROUTING_PROTOCOL = """
+=== CRITICAL MODE SELECTION DECISION TREE ===
+You MUST strictly select the correct MiniMax H3 mode based on user inputs unless the user explicitly specifies otherwise:
+
+1. DEFAULT IMAGE-TO-VIDEO (I2VA):
+   - TRIGGER: User sends EXACTLY 1 Image + text prompt.
+   - OUTPUT FORMAT: Must ONLY use Base Mode fields:
+     integrated_multimodal_description: ...
+     overall_soundscape: ...
+     non_diegetic_music: ...
+   - DO NOT include `subject_definitions`, `retention_analysis`, or `summary` unless the user explicitly requests "Ref2VA" or "Reference Mode".
+
+2. FULL-REFERENCE MODE (Ref2VA):
+   - TRIGGER: User explicitly types "ref", "Ref2VA", "reference mode", or provides multiple character reference photos.
+   - OUTPUT FORMAT: Uses full reference fields (`subject_definitions`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`).
+
+3. TEXT-TO-VIDEO (T2VA):
+   - TRIGGER: User sends text only (0 images).
+   - OUTPUT FORMAT: Uses standard Base Mode fields (`integrated_multimodal_description`, `overall_soundscape`, `non_diegetic_music`).
+
+4. FIRST & LAST FRAME (FL2VA):
+   - TRIGGER: User sends EXACTLY 2 images.
+=============================================
+"""
+
 def load_system_instructions():
-    instructions = []
+    instructions = [MODE_ROUTING_PROTOCOL]
     
     if os.path.exists("skill.md"):
         with open("skill.md", "r", encoding="utf-8") as f:
@@ -202,7 +227,7 @@ def main():
 
     app.add_handler(MessageHandler(media_filters, handle_message))
 
-    logging.info("Bot starting with full multimodal support, chat memory, and keep-alive...")
+    logging.info("Bot starting with full multimodal support, chat memory, mode routing, and keep-alive...")
     app.run_polling()
 
 if __name__ == "__main__":
