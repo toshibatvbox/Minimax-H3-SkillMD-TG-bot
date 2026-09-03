@@ -12,7 +12,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# --- Flask Keep-Alive Server ---
+# --- 1. Flask Keep-Alive Server for Render ---
 web_app = Flask('')
 
 @web_app.route('/')
@@ -28,16 +28,14 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# --- System Instructions Loading ---
+# --- 2. System Instructions Loader (skill.md + references) ---
 def load_system_instructions():
     instructions = []
     
-    # Load primary skill.md
     if os.path.exists("skill.md"):
         with open("skill.md", "r", encoding="utf-8") as f:
             instructions.append(f.read())
             
-    # Load split reference files under Option B
     for ref_file in ["references/base-en.txt", "references/ref-en.txt"]:
         if os.path.exists(ref_file):
             with open(ref_file, "r", encoding="utf-8") as f:
@@ -51,7 +49,7 @@ def load_system_instructions():
 SYSTEM_INSTRUCTIONS = load_system_instructions()
 ai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-# --- Relaxed Safety Settings for Visual & Art Reading ---
+# --- 3. Safety Settings (BLOCK_NONE for visual/art analysis) ---
 SAFETY_SETTINGS = [
     types.SafetySetting(
         category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
@@ -73,33 +71,58 @@ SAFETY_SETTINGS = [
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send me your draft prompt, video details, or an image with instructions, and I will format it into a MiniMax H3 prompt."
+        "Send me text, images, video clips, or audio files, and I will format them into a MiniMax H3 prompt."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_chat_action(action="typing")
+    message = update.message
+    if not message:
+        return
 
+    await message.reply_chat_action(action="typing")
     contents = []
 
-    # Handle attached image
-    if update.message.photo:
-        photo_file = await update.message.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
-        
-        image_part = types.Part.from_bytes(
-            data=bytes(photo_bytes),
-            mime_type="image/jpeg"
+    media_obj = None
+    mime_type = None
+
+    # Handle media types
+    if message.photo:
+        media_obj = message.photo[-1]
+        mime_type = "image/jpeg"
+    elif message.video:
+        media_obj = message.video
+        mime_type = message.video.mime_type or "video/mp4"
+    elif message.video_note:
+        media_obj = message.video_note
+        mime_type = "video/mp4"
+    elif message.audio:
+        media_obj = message.audio
+        mime_type = message.audio.mime_type or "audio/mpeg"
+    elif message.voice:
+        media_obj = message.voice
+        mime_type = message.voice.mime_type or "audio/ogg"
+
+    # Download byte stream for attached media
+    if media_obj:
+        file_info = await context.bot.get_file(media_obj.file_id)
+        media_bytes = await file_info.download_as_bytearray()
+        contents.append(
+            types.Part.from_bytes(
+                data=bytes(media_bytes),
+                mime_type=mime_type
+            )
         )
-        contents.append(image_part)
-        
-        user_text = update.message.caption or (
-            "Analyze this artwork objectively (composition, subject, aesthetic) "
-            "and generate a MiniMax H3 prompt."
-        )
+
+    # Process text or caption
+    user_text = message.text or message.caption or (
+        "Analyze this media input objectively and generate a MiniMax H3 prompt." if media_obj else ""
+    )
+    if user_text:
         contents.append(user_text)
-    else:
-        # Handle text message
-        contents.append(update.message.text)
+
+    if not contents:
+        await message.reply_text("Please send text, an image, a video, or an audio file.")
+        return
 
     try:
         config = types.GenerateContentConfig(
@@ -112,24 +135,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             contents=contents,
             config=config,
         )
-        await update.message.reply_text(response.text)
+        await message.reply_text(response.text)
     except Exception as e:
         logging.error(f"Error generating content: {e}")
-        await update.message.reply_text("An error occurred while processing your request.")
+        await message.reply_text("An error occurred while processing your request.")
 
 def main():
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not telegram_token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
 
-    # Start Flask background server for Render uptime check
     keep_alive()
 
     app = ApplicationBuilder().token(telegram_token).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message))
 
-    logging.info("Bot starting...")
+    media_filters = (
+        filters.TEXT | 
+        filters.PHOTO | 
+        filters.VIDEO | 
+        filters.VIDEO_NOTE | 
+        filters.AUDIO | 
+        filters.VOICE
+    ) & ~filters.COMMAND
+
+    app.add_handler(MessageHandler(media_filters, handle_message))
+
+    logging.info("Bot starting with full multimodal support and keep-alive...")
     app.run_polling()
 
 if __name__ == "__main__":
