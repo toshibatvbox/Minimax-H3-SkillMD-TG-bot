@@ -12,6 +12,10 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# Global dictionary to maintain chat history per Telegram user/chat
+CHAT_HISTORIES = {}
+MAX_HISTORY_MESSAGES = 20  # Retains up to 10 back-and-forth turns per chat
+
 # --- 1. Flask Keep-Alive Server for Render ---
 web_app = Flask('')
 
@@ -70,17 +74,30 @@ SAFETY_SETTINGS = [
 ]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    CHAT_HISTORIES[chat_id] = []
     await update.message.reply_text(
-        "Send me text, images, video clips, or audio files, and I will format them into a MiniMax H3 prompt."
+        "Send me text, images, video clips, or audio files, and I will format them into a MiniMax H3 prompt.\n\n"
+        "💡 Commands:\n"
+        "/reset or /new — Clear chat memory to start a fresh project."
     )
+
+async def reset_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    CHAT_HISTORIES[chat_id] = []
+    await update.message.reply_text("🔄 Conversation memory cleared! Ready for a new prompt request.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
         return
 
+    chat_id = update.effective_chat.id
+    if chat_id not in CHAT_HISTORIES:
+        CHAT_HISTORIES[chat_id] = []
+
     await message.reply_chat_action(action="typing")
-    contents = []
+    current_parts = []
 
     media_obj = None
     mime_type = None
@@ -106,7 +123,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if media_obj:
         file_info = await context.bot.get_file(media_obj.file_id)
         media_bytes = await file_info.download_as_bytearray()
-        contents.append(
+        current_parts.append(
             types.Part.from_bytes(
                 data=bytes(media_bytes),
                 mime_type=mime_type
@@ -118,11 +135,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Analyze this media input objectively and generate a MiniMax H3 prompt." if media_obj else ""
     )
     if user_text:
-        contents.append(user_text)
+        current_parts.append(types.Part.from_text(text=user_text))
 
-    if not contents:
+    if not current_parts:
         await message.reply_text("Please send text, an image, a video, or an audio file.")
         return
+
+    # Add current turn to session history
+    user_content = types.Content(role="user", parts=current_parts)
+    CHAT_HISTORIES[chat_id].append(user_content)
+
+    # Trim history buffer to prevent token overflow
+    if len(CHAT_HISTORIES[chat_id]) > MAX_HISTORY_MESSAGES:
+        CHAT_HISTORIES[chat_id] = CHAT_HISTORIES[chat_id][-MAX_HISTORY_MESSAGES:]
 
     try:
         config = types.GenerateContentConfig(
@@ -130,15 +155,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safety_settings=SAFETY_SETTINGS,
         )
 
+        # Pass complete multi-turn history list to Gemini
         response = ai_client.models.generate_content(
             model="gemini-3.6-flash",
-            contents=contents,
+            contents=CHAT_HISTORIES[chat_id],
             config=config,
         )
-        await message.reply_text(response.text)
+
+        if response.text:
+            model_content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response.text)]
+            )
+            CHAT_HISTORIES[chat_id].append(model_content)
+            await message.reply_text(response.text)
+        else:
+            await message.reply_text("⚠️ No text output returned by the model.")
+
     except Exception as e:
+        # Revert memory stack on API error
+        if CHAT_HISTORIES[chat_id]:
+            CHAT_HISTORIES[chat_id].pop()
         logging.error(f"Error generating content: {e}")
-        await message.reply_text("An error occurred while processing your request.")
+        await message.reply_text(f"⚠️ Error processing request: {e}")
 
 def main():
     telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -149,6 +188,8 @@ def main():
 
     app = ApplicationBuilder().token(telegram_token).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("reset", reset_chat))
+    app.add_handler(CommandHandler("new", reset_chat))
 
     media_filters = (
         filters.TEXT | 
@@ -161,7 +202,7 @@ def main():
 
     app.add_handler(MessageHandler(media_filters, handle_message))
 
-    logging.info("Bot starting with full multimodal support and keep-alive...")
+    logging.info("Bot starting with full multimodal support, chat memory, and keep-alive...")
     app.run_polling()
 
 if __name__ == "__main__":
