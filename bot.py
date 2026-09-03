@@ -17,7 +17,7 @@ logging.basicConfig(
 CHAT_HISTORIES = {}
 MAX_HISTORY_MESSAGES = 20  # Retains up to 10 back-and-forth turns per chat
 
-# Global buffer to aggregate Telegram photo albums / media groups
+# Global buffer to aggregate Telegram photo albums / media groups safely
 MEDIA_GROUPS = {}
 
 # --- 1. Flask Keep-Alive Server for Render ---
@@ -137,34 +137,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     media_group_id = message.media_group_id
 
-    # Aggregate multi-image uploads (Telegram photo albums) into a single API batch
+    # Thread-safe multi-image album collection logic
     if media_group_id:
         if media_group_id not in MEDIA_GROUPS:
-            MEDIA_GROUPS[media_group_id] = {"parts": [], "text": ""}
+            MEDIA_GROUPS[media_group_id] = {
+                "parts": [],
+                "text": "",
+                "lock": asyncio.Lock(),
+                "processed": False
+            }
 
+        group = MEDIA_GROUPS[media_group_id]
+
+        part = None
         if message.photo:
             file_info = await context.bot.get_file(message.photo[-1].file_id)
             media_bytes = await file_info.download_as_bytearray()
-            MEDIA_GROUPS[media_group_id]["parts"].append(
-                types.Part.from_bytes(data=bytes(media_bytes), mime_type="image/jpeg")
-            )
+            part = types.Part.from_bytes(data=bytes(media_bytes), mime_type="image/jpeg")
         elif message.video:
             file_info = await context.bot.get_file(message.video.file_id)
             media_bytes = await file_info.download_as_bytearray()
-            MEDIA_GROUPS[media_group_id]["parts"].append(
-                types.Part.from_bytes(data=bytes(media_bytes), mime_type=message.video.mime_type or "video/mp4")
-            )
+            part = types.Part.from_bytes(data=bytes(media_bytes), mime_type=message.video.mime_type or "video/mp4")
 
         caption = message.text or message.caption
-        if caption:
-            MEDIA_GROUPS[media_group_id]["text"] = caption
 
-        await asyncio.sleep(1.2)
+        async with group["lock"]:
+            if part:
+                group["parts"].append(part)
+            if caption:
+                group["text"] = caption
 
-        if media_group_id not in MEDIA_GROUPS:
-            return  # Handled by parallel event handler turn
+        # Allow parallel album tasks to finish downloading
+        await asyncio.sleep(2.0)
 
-        group_data = MEDIA_GROUPS.pop(media_group_id)
+        async with group["lock"]:
+            if group["processed"]:
+                return  # Exit parallel thread if album was already submitted
+            group["processed"] = True
+
+        group_data = MEDIA_GROUPS.pop(media_group_id, None)
+        if not group_data or not group_data["parts"]:
+            return
+
         current_parts = group_data["parts"]
         user_text = group_data["text"] or "Analyze these media inputs objectively and generate a MiniMax H3 prompt."
         current_parts.append(types.Part.from_text(text=user_text))
@@ -207,7 +221,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Please send text, an image, a video, or an audio file.")
         return
 
-    # Store user turn in active chat session
+    # Store user payload in conversation history
     user_content = types.Content(role="user", parts=current_parts)
     CHAT_HISTORIES[chat_id].append(user_content)
 
@@ -222,7 +236,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = None
     last_error = None
 
-    # Sequential iteration across Gemini 3.x models
+    # Sequential iteration across Gemini 3.x production models
     for model_name in FALLBACK_MODELS:
         try:
             response = ai_client.models.generate_content(
@@ -274,7 +288,7 @@ def main():
 
     app.add_handler(MessageHandler(media_filters, handle_message))
 
-    logging.info("Bot starting with album aggregation, Gemini 3.x fallback routing, and keep-alive...")
+    logging.info("Bot starting with thread-safe album aggregation, Gemini 3.x fallback routing, and keep-alive...")
     app.run_polling()
 
 if __name__ == "__main__":
