@@ -180,12 +180,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safety_settings=SAFETY_SETTINGS,
         )
 
-        # Pass complete multi-turn history list to Gemini
-        response = ai_client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=CHAT_HISTORIES[chat_id],
-            config=config,
-        )
+        # Primary attempt with gemini-3.6-flash, fallback to gemini-2.0-flash on quota limit
+        try:
+            response = ai_client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=CHAT_HISTORIES[chat_id],
+                config=config,
+            )
+        except Exception as api_err:
+            err_str = str(api_err)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+                logging.warning("Gemini 3.6 Flash quota reached. Falling back to Gemini 2.0 Flash...")
+                response = ai_client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=CHAT_HISTORIES[chat_id],
+                    config=config,
+                )
+            else:
+                raise api_err
 
         if response.text:
             model_content = types.Content(
@@ -227,7 +239,7 @@ def main():
 
     app.add_handler(MessageHandler(media_filters, handle_message))
 
-    logging.info("Bot starting with full multimodal support, chat memory, mode routing, and keep-alive...")
+    logging.info("Bot starting with full multimodal support, chat memory, mode routing, automatic model fallback, and keep-alive...")
     app.run_polling()
 
 if __name__ == "__main__":
